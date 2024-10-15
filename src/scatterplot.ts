@@ -121,6 +121,7 @@ export class Scatterplot {
     this.ready = new Promise((resolve) => {
       this.mark_ready = resolve;
     });
+
     this.click_handler = new ClickFunction(this);
     this.tooltip_handler = new TooltipHTML(this);
     this.label_click_handler = new LabelClick(this);
@@ -389,10 +390,8 @@ export class Scatterplot {
 
   async reinitialize() {
     const { prefs } = this;
-
-    await this.deeptable.ready;
+    await this.deeptable.promise;
     await this.deeptable.root_tile.get_column('x');
-
     this._renderer = new ReglRenderer(
       '#container-for-webgl-canvas',
       this.deeptable,
@@ -404,7 +403,6 @@ export class Scatterplot {
     this._zoom.initialize_zoom();
 
     // Needs the zoom built as well.
-
     const bkgd = select('#container-for-canvas-2d-background').select(
       'canvas',
     ) as Selection<
@@ -420,8 +418,11 @@ export class Scatterplot {
     ctx.fillRect(0, 0, window.innerWidth * 2, window.innerHeight * 2);
 
     void this._renderer.initialize();
-    void this.deeptable.promise.then(() => this.mark_ready());
-    return this.ready;
+    await this.deeptable.promise.then(() => {
+      this.mark_ready();
+    });
+    this.mark_ready();
+    return;
   }
 
   /*
@@ -634,11 +635,29 @@ export class Scatterplot {
       return;
     }
     await this.plot_queue;
+
+    // Ensure that the deeptable exists.
+    if (this._root === undefined) {
+      const { source_url, arrow_table, arrow_buffer } =
+        prefs as DS.InitialAPICall;
+      const dataSpec = { source_url, arrow_table, arrow_buffer } as DS.DataSpec;
+      if (Object.values(dataSpec).filter((x) => x !== undefined).length !== 1) {
+        throw new Error(
+          'The initial API call specify exactly one of source_url, arrow_table, or arrow_buffer',
+        );
+      }
+      await this.load_deeptable(dataSpec);
+    }
+    this.update_prefs(prefs);
+    // Then ensure the renderer and interaction handlers exist.
+    if (this._zoom === undefined || this._renderer === undefined) {
+      await this.reinitialize();
+    }
     if (prefs) {
       await this.start_transformations(prefs);
     }
+
     this.plot_queue = this.unsafe_plotAPI(prefs);
-    await this.plot_queue;
 
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     for (const [_, hook] of Object.entries(this.hooks)) {
@@ -668,50 +687,23 @@ export class Scatterplot {
       if (this.prefs.duration < delay) {
         delay = this.prefs.duration;
       }
-      const needed_keys: Set<string> = neededFieldsToPlot(this.prefs);
       if (!prefs.encoding) {
         resolve();
       }
-      const starttime = Date.now();
-
-      if (this._renderer) {
-        const promises: Promise<void>[] = [];
-        const sine_qua_non: Promise<void>[] = [
-          this.deeptable.root_tile.require_columns(needed_keys),
-        ];
-
-        // Immediately
-        for (const tile of this._renderer.visible_tiles()) {
-          // Allow unready tiles to stay unready; who know's what's going on there.
-          const manager = tile._buffer_manager;
-          if (manager !== undefined && manager.ready()) {
-            for (const key of needed_keys) {
-              if (tile.hasLoadedColumn(key)) {
-                manager.create_regl_buffer(key);
-              }
-            }
-          }
-        }
-        if (promises.length === 0) {
-          resolve();
-        } else {
-          // It's important to get at least the first promise done,
-          // because it's used to determine some details about state.
-          void Promise.all(sine_qua_non).then(() => {
-            const endtime = Date.now();
-            const elapsed = endtime - starttime;
-            if (elapsed < delay) {
-              setTimeout(() => {
-                resolve();
-              }, delay - elapsed);
-            } else {
-              resolve();
-            }
-          });
-        }
-      } else {
-        resolve();
+      if (!this._renderer) {
+        throw new Error('No renderer has been initialized');
       }
+      //
+      const needed_keys = neededFieldsToPlot(prefs.encoding);
+      this.deeptable.root_tile.require_columns(
+        [...needed_keys].map((k) => k[0]),
+      );
+      // Immediately start loading what we can onto the GPUs, too.
+      for (const tile of this.renderer.visible_tiles()) {
+        this._renderer.bufferManager.ready(tile, needed_keys);
+      }
+      // TODO: There should be a setTimeout here before the resolution
+      resolve();
     });
   }
   /**
@@ -753,28 +745,12 @@ export class Scatterplot {
 
     this.update_prefs(prefs);
 
-    if (this._root === undefined) {
-      const { source_url, arrow_table, arrow_buffer } =
-        prefs as DS.InitialAPICall;
-      const dataSpec = { source_url, arrow_table, arrow_buffer } as DS.DataSpec;
-      if (Object.values(dataSpec).filter((x) => x !== undefined).length !== 1) {
-        throw new Error(
-          'The initial API call specify exactly one of source_url, arrow_table, or arrow_buffer',
-        );
-      }
-      await this.load_deeptable(dataSpec);
-    }
-
     if (prefs.transformations) {
       for (const [k, func] of Object.entries(prefs.transformations)) {
         if (!this.deeptable.transformations[k]) {
           this.deeptable.register_transformation(k, func);
         }
       }
-    }
-
-    if (this._zoom === undefined) {
-      await this.reinitialize();
     }
 
     const renderer = this._renderer;
